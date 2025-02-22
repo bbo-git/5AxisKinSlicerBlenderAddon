@@ -18,6 +18,7 @@ import h5py
 from scipy.ndimage import gaussian_filter1d
 import json
 import time
+import gc
     
 class FiveTP_OT_Execute(bpy.types.Operator):
     bl_idname = "five_tp.execute"
@@ -492,9 +493,38 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 has_new_point = False
 
         return {'RUNNING_MODAL'}
+    
+    def fast_cleanup(self):
+        # Clear any leftover data or variables
+        global labCurrentPoints
+        if "labCurrentPoints" in globals():
+            del labCurrentPoints
+
+        # Optional: Remove temporary objects if needed
+        for obj in bpy.data.objects:
+            if obj.name.startswith("Temp_"):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        # Garbage collection to clear Python memory
+        gc.collect()
+
+    def run_algorithm(self):
+        # Disable undo and viewport updates for speed
+        bpy.context.preferences.edit.use_global_undo = False
+        bpy.context.view_layer.depsgraph.update()  # Force depsgraph update just once
+        
+        # Your core algorithm here
+        print("Running algorithm...")
+
+        # Re-enable undo after the run
+        bpy.context.preferences.edit.use_global_undo = True
+
 
     def execute(self, context):
         bpy.props.stop_execution = False
+        
+        self.fast_cleanup()
+        self.run_algorithm()
         
         if os.path.exists("/Users/jairo/Documents/Spiral/cloud.h5"):
             print("File exists!")
@@ -758,6 +788,57 @@ class OBJECT_OT_PrepareModelForSlicing(bpy.types.Operator):
             self.report({'ERROR'}, "No active object selected.")
             return {'CANCELLED'}
 
+class TrimToWholeLapOperator(bpy.types.Operator):
+    """Trim to the last completed lap"""
+    bl_idname = "object.trim_to_whole_lap"
+    bl_label = "Trim to Whole Lap"
+    
+    def execute(self, context):
+        # Get the curve object
+        curve_obj = bpy.data.objects.get("Spiral_Curve")
+        if not curve_obj or curve_obj.type != 'CURVE':
+            self.report({'ERROR'}, "Spiral_Curve not found or not a curve object.")
+            return {'CANCELLED'}
+        
+        # Get spline points and last point from properties
+        spline = curve_obj.data.splines.active or curve_obj.data.splines[0]
+        points = spline.bezier_points if spline.type == 'BEZIER' else spline.points
+        last_point = context.scene.five_tp_props.points[-1]
+        
+        print(f"last_point to find on curve: {last_point}")
+
+        # Convert last_point to a format comparable with curve points
+        last_point_coords = (last_point.x, last_point.y, last_point.z)
+        
+        # Find the index of the last point in the curve
+        trim_index = -1
+        for i, point in enumerate(points):
+            co = point.co if spline.type != 'BEZIER' else point.co.xyz
+            if all(abs(a - b) < 1e-2 for a, b in zip(co, last_point_coords)):
+                trim_index = i
+                break
+        
+        if trim_index == -1:
+            self.report({'ERROR'}, "Last point not found in the curve.")
+            return {'CANCELLED'}
+        
+        for i in range(trim_index + 1, len(points)):
+            points[i].select = True  # Select points beyond the last lap
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        
+        # Now, delete the selected points (vertices)
+        bpy.ops.curve.delete(type='VERT')
+        
+        curve_obj.data.update()  # Ensure Blender knows the data changed
+        
+        self.report({'INFO'}, f"Trimmed curve at index {trim_index}.")
+        return {'FINISHED'}
+    
+    def trim_points_to_last_lap(points, trim_index):
+        # Trim all points after the trim_index (exclusive)
+        if len(points) > trim_index + 1:
+            points[:] = points[:trim_index + 1]  # This modifies the list in-place to keep only up to the trim_index
 
 class FiveTPPoint(bpy.types.PropertyGroup):
     x: bpy.props.FloatProperty()
@@ -835,6 +916,12 @@ class PT_FiveTP_PT_Panel(bpy.types.Panel):
         layout.prop(props, "current_lap_count")
         layout.prop(props, "accuracy_radius")
         layout.prop(props, "overwrite_factor_start")
+        
+        layout.separator()
+
+        layout.label(text="Lap Management")
+        layout.operator("object.trim_to_whole_lap")
+
 
         layout.separator()
         
@@ -847,15 +934,31 @@ class PT_FiveTP_PT_Panel(bpy.types.Panel):
         row = layout.row()
         row.template_list("UI_UL_list", "points_list", context.scene, "points", context.scene, "active_point_index", rows=5)
         
-        if props.points:
-            for point in props.points:
-                box = row.box()
-                box.label(text=f"X: {point.x:.2f}, Y: {point.y:.2f}, Z: {point.z:.2f}")
-        else:
-            row.label(text="No points stored.")
+        row = layout.row()
+        row.template_list(
+            "POINTS_UL_items", "points_list",
+            props, "points",
+            props, "points_index",
+            rows=5
+        )
+
+        # Add/Remove buttons
+        col = row.column(align=True)
+        col.operator("points.add", icon='ADD', text="")
+        col.operator("points.remove", icon='REMOVE', text="")
+
+        layout.separator()
         
         row = layout.row()
         row.operator("five_tp.clear_points", icon="TRASH")
+        
+class POINTS_UL_items(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        # Ensure item is a PTPoint
+        if item:
+            layout.label(text=f"X: {item.x:.2f}, Y: {item.y:.2f}, Z: {item.z:.2f}")
+        else:
+            layout.label(text="No point")
 
 class FiveTP_OT_ResetLapCount(bpy.types.Operator):
     bl_idname = "five_tp.reset_lap_count"
@@ -876,6 +979,7 @@ def register():
     bpy.utils.register_class(FIVE_TP_OT_StopExecution)
     bpy.utils.register_class(FIVE_TP_OT_ClearPoints)
     bpy.utils.register_class(FiveTP_OT_ResetLapCount)
+    bpy.utils.register_class(TrimToWholeLapOperator)
     
     bpy.utils.register_class(OBJECT_OT_PrepareModelForSlicing)
 
@@ -888,6 +992,7 @@ def unregister():
     bpy.utils.unregister_class(FIVE_TP_OT_ClearPoints)
     bpy.utils.unregister_class(FiveTPProperties)
     bpy.utils.unregister_class(OBJECT_OT_PrepareModelForSlicing)
+    bpy.utils.unregister_class(TrimToWholeLapOperator)
     del bpy.types.Scene.five_tp_props
 
 if __name__ == "__main__":
