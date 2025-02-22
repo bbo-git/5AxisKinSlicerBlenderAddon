@@ -308,8 +308,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if self.should_update:
             
-            self.should_update = False
-            
             print("#####UPDATE SPIRAL######")
             start_time = time.time()
             self.spiral_pcd = o3d.geometry.PointCloud()
@@ -317,9 +315,10 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             last_points = []
             if not self.past_first:
                 self.past_first = True
-                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)
-            else:
                 last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)[:-4]
+            else:
+                self.should_update = False
+                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)
                 
             print(f"last points length: {len(last_points)}")
             current_spiral_points_np = np.array([p.co.xyz for p in last_points])  # Ensure correct shape (N,3)
