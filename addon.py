@@ -180,6 +180,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if selected_points:
             bpy.context.scene.five_tp_props.points.clear()
+            print(f"number of points left in last points collection; {len(bpy.context.scene.five_tp_props.points)}")
             for p in selected_points:
                 point = bpy.context.scene.five_tp_props.points.add() 
                 point.x = p.co.x 
@@ -224,7 +225,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         else:
             for point in curve_obj.data.splines[0].points[-len(self.current_lap_points):]:
                 point.select = True  # Select the points to smooth
-               
+           
+        self.current_lap_points = []    
         selected_points = [point for point in curve_obj.data.splines[0].points if point.select]
         
         for i in range(smooth_iterations):
@@ -316,10 +318,10 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             last_points = []
             if not self.past_first:
                 self.past_first = True
-                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)[:-4]
+                last_points = self.handle_new_lap(lap_0=(bpy.context.scene.five_tp_props.current_lap_count == 0))[:-4]
             else:
                 self.should_update = False
-                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)
+                last_points = self.handle_new_lap(lap_0=(bpy.context.scene.five_tp_props.current_lap_count == 0))
                 
             print(f"last points length: {len(last_points)}")
             current_spiral_points_np = np.array([p.co.xyz for p in last_points])  # Ensure correct shape (N,3)
@@ -332,6 +334,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             
             z_min = min(current_spiral_points_np, key=lambda p: p[2])[2] - 0.2
             z_max = max(current_spiral_points_np, key=lambda p: p[2])[2] + 0.2
+            
+            print(f"z_min: {z_min}, z_max: {z_max}, curr_height: {self.current_point[2]}")
             
             points = np.asarray(self.big_pcd.points)
             self.relevant_big_pcd_points = points[(points[:, 2] >= z_min) & (points[:, 2] <= z_max)]
@@ -834,7 +838,7 @@ class TrimToWholeLapOperator(bpy.types.Operator):
             
             print(distance)
             
-            if distance < 10e-3:  # Tolerance of 10^-3
+            if distance < 10e-2:  # Tolerance of 10^-3
                 trim_index = i
                 break
 
