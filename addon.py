@@ -788,58 +788,75 @@ class OBJECT_OT_PrepareModelForSlicing(bpy.types.Operator):
             self.report({'ERROR'}, "No active object selected.")
             return {'CANCELLED'}
 
+
 class TrimToWholeLapOperator(bpy.types.Operator):
-    """Trim to the last completed lap"""
     bl_idname = "object.trim_to_whole_lap"
     bl_label = "Trim to Whole Lap"
-    
+
     def execute(self, context):
         # Get the curve object
         curve_obj = bpy.data.objects.get("Spiral_Curve")
-        if not curve_obj or curve_obj.type != 'CURVE':
-            self.report({'ERROR'}, "Spiral_Curve not found or not a curve object.")
+        if curve_obj is None or curve_obj.type != 'CURVE':
+            self.report({'ERROR'}, "Spiral_Curve not found or not a curve")
             return {'CANCELLED'}
-        
-        # Get spline points and last point from properties
-        spline = curve_obj.data.splines.active or curve_obj.data.splines[0]
-        points = spline.bezier_points if spline.type == 'BEZIER' else spline.points
-        last_point = context.scene.five_tp_props.points[-1]
-        
-        print(f"last_point to find on curve: {last_point}")
 
-        # Convert last_point to a format comparable with curve points
-        last_point_coords = (last_point.x, last_point.y, last_point.z)
+        # Ensure we are in the correct mode (Edit mode)
+        bpy.context.view_layer.objects.active = curve_obj
+        if curve_obj.mode != 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        # Get the points from props
+        props = context.scene.five_tp_props
+        points = props.points
         
-        # Find the index of the last point in the curve
+        if len(points) == 0:
+            self.report({'ERROR'}, "No points found in props.points")
+            bpy.ops.object.mode_set(mode='OBJECT')
+            return {'CANCELLED'}
+
+        # Last point in props.points marks the end of the last lap
+        last_lap_point = points[-1]
+
+        # Deselect everything first
+        bpy.ops.curve.select_all(action='DESELECT')
+
+        # Get the curve data
+        # Find the spline point closest to the last lap point based on XYZ coordinates
         trim_index = -1
-        for i, point in enumerate(points):
-            co = point.co if spline.type != 'BEZIER' else point.co.xyz
-            if all(abs(a - b) < 1e-2 for a, b in zip(co, last_point_coords)):
+        min_distance = float('inf')
+        
+        print("look for trim index")
+
+        # Loop through the spline points and find the closest match
+        for i, point in enumerate(curve_obj.data.splines[0].points):
+            point = point.co.xyz  # XYZ coordinates of spline point
+            distance = (point - mathutils.Vector((last_lap_point.x, last_lap_point.y, last_lap_point.z))).length
+            
+            print(distance)
+            
+            if distance < 10e-3:  # Tolerance of 10^-3
                 trim_index = i
                 break
-        
-        if trim_index == -1:
-            self.report({'ERROR'}, "Last point not found in the curve.")
-            return {'CANCELLED'}
-        
-        for i in range(trim_index + 1, len(points)):
-            points[i].select = True  # Select points beyond the last lap
 
-        bpy.ops.object.mode_set(mode='EDIT')
-        
-        # Now, delete the selected points (vertices)
+        if trim_index == -1:
+            self.report({'ERROR'}, "Couldn't find the corresponding spline point for the last lap.")
+            bpy.ops.object.mode_set(mode='OBJECT')
+            return {'CANCELLED'}
+
+        # Select only the points beyond the last lap in the spline
+        for i, point in enumerate(curve_obj.data.splines[0].points):
+            if i > trim_index:  # Select points beyond the last lap
+                point.select = True
+
+        # Delete the selected points (after the last lap)
         bpy.ops.curve.delete(type='VERT')
-        
-        curve_obj.data.update()  # Ensure Blender knows the data changed
-        
-        self.report({'INFO'}, f"Trimmed curve at index {trim_index}.")
+
+        # Switch back to object mode
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        self.report({'INFO'}, f"Trimmed points beyond the last lap (up to index {trim_index}).")
         return {'FINISHED'}
     
-    def trim_points_to_last_lap(points, trim_index):
-        # Trim all points after the trim_index (exclusive)
-        if len(points) > trim_index + 1:
-            points[:] = points[:trim_index + 1]  # This modifies the list in-place to keep only up to the trim_index
-
 class FiveTPPoint(bpy.types.PropertyGroup):
     x: bpy.props.FloatProperty()
     y: bpy.props.FloatProperty()
@@ -870,6 +887,7 @@ class FiveTPProperties(bpy.types.PropertyGroup):
         max=10.0
     )
     points: bpy.props.CollectionProperty(type=FiveTPPoint)
+    points_index: bpy.props.IntProperty() 
     stop_execution: bpy.props.BoolProperty(name="Stop Execution", default=False)
 
 class FIVE_TP_OT_ClearPoints(bpy.types.Operator):
@@ -932,9 +950,6 @@ class PT_FiveTP_PT_Panel(bpy.types.Panel):
         layout.separator()
         
         row = layout.row()
-        row.template_list("UI_UL_list", "points_list", context.scene, "points", context.scene, "active_point_index", rows=5)
-        
-        row = layout.row()
         row.template_list(
             "POINTS_UL_items", "points_list",
             props, "points",
@@ -944,9 +959,6 @@ class PT_FiveTP_PT_Panel(bpy.types.Panel):
 
         # Add/Remove buttons
         col = row.column(align=True)
-        col.operator("points.add", icon='ADD', text="")
-        col.operator("points.remove", icon='REMOVE', text="")
-
         layout.separator()
         
         row = layout.row()
@@ -980,6 +992,7 @@ def register():
     bpy.utils.register_class(FIVE_TP_OT_ClearPoints)
     bpy.utils.register_class(FiveTP_OT_ResetLapCount)
     bpy.utils.register_class(TrimToWholeLapOperator)
+    bpy.utils.register_class(POINTS_UL_items)
     
     bpy.utils.register_class(OBJECT_OT_PrepareModelForSlicing)
 
@@ -993,6 +1006,7 @@ def unregister():
     bpy.utils.unregister_class(FiveTPProperties)
     bpy.utils.unregister_class(OBJECT_OT_PrepareModelForSlicing)
     bpy.utils.unregister_class(TrimToWholeLapOperator)
+    bpy.utils.unregister_class(POINTS_UL_items)
     del bpy.types.Scene.five_tp_props
 
 if __name__ == "__main__":
