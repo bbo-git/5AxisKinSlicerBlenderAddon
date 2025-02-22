@@ -5,6 +5,7 @@ import numpy as np
 from scipy.spatial import cKDTree  # Faster nearest neighbor search
 from scipy.spatial.distance import euclidean  # For distance calculation
 from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import normalize
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import euclidean
 import mathutils
@@ -47,80 +48,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
     spiral_tree = None
     relevant_big_pcd_points = []
     
-    def smooth_and_shrinkwrap_curve(self, curve_obj, target_obj, smooth_iterations=10, shrinkwrap_offset=0.0, initial=False):
-        """
-        Smooths the given curve object and then applies a shrinkwrap modifier to it using bpy.ops.
-        
-        Parameters:
-        - curve_obj: The Blender curve object to be smoothed and shrinkwrapped.
-        - target_obj: The target Blender object that the curve will be shrinkwrapped to (e.g., a mesh).
-        - smooth_iterations: The number of smoothing iterations to apply to the curve.
-        - shrinkwrap_offset: The offset distance for the shrinkwrap modifier.
-        
-        Returns:
-        - The curve object after smoothing and shrinkwrapping.
-        """
-        # Ensure the object is in Object mode
-        bpy.context.view_layer.objects.active = curve_obj
-        if curve_obj.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Ensure the curve object is of the correct type
-        if curve_obj.type != 'CURVE':
-            print("The provided object is not a curve.")
-            return None
-
-        print(f"Smoothing curve with {smooth_iterations} iterations...")
-        
-        # Switch to Edit mode to smooth the curve
-        bpy.ops.object.mode_set(mode='EDIT')
-        
-        # Select the relevant points that you want to smooth
-        bpy.ops.curve.select_all(action='DESELECT')  # First deselect all
-        
-        if initial:
-            for point in curve_obj.data.splines[0].points[-len(self.current_lap_points):]:
-                point.select = True  # Select the points to smooth
-        else:
-            for point in curve_obj.data.splines[0].points:
-                point.select = True  # Select the points to smooth
-                
-        selected_points = [point for point in curve_obj.data.splines[0].points if point.select]
-        
-        for i in range(smooth_iterations):
-            bpy.ops.curve.smooth()  # Apply the smooth operation
-            print(f"Smoothed curve iteration {i + 1}")
-            
-            # Update and refresh after each smoothing step
-            bpy.context.view_layer.update()  # Ensure the view layer is updated
-            bpy.ops.wm.redraw_timer(type='DRAW', iterations=1)  # Force the viewport to refresh
-        
-        # Perform smoothing for the specified number of iterations
-        
-        # Switch back to Object mode after smoothing
-        bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Add Shrinkwrap modifier using bpy.ops
-        print("Adding Shrinkwrap modifier...")
-        bpy.ops.object.modifier_add(type='SHRINKWRAP')
-
-        # Get the Shrinkwrap modifier
-        shrinkwrap_modifier = curve_obj.modifiers[-1]
-        shrinkwrap_modifier.target = target_obj
-        shrinkwrap_modifier.offset = shrinkwrap_offset
-        shrinkwrap_modifier.wrap_method = 'NEAREST_SURFACEPOINT'  # Or use another method
-        print(f"Shrinkwrap modifier added: {shrinkwrap_modifier}")
-
-        # Apply the Shrinkwrap modifier
-        bpy.ops.object.modifier_apply(modifier=shrinkwrap_modifier.name)
-        print("Shrinkwrap modifier applied.")
-
-        # Final update and refresh to make sure everything is reflected
-        bpy.context.view_layer.update()  # Final view layer update
-        bpy.ops.wm.redraw_timer(type='DRAW', iterations=1)  # Final window redraw
-        
-        print(f"Returning {len(selected_points)} points")
-        return selected_points
+    should_update = True
+    past_first = False
         
     def is_not_visited(self, point, tree):
         dist, _ = tree.query(point)
@@ -239,15 +168,14 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         return filtered_points
 
     
-    def handle_new_lap(self, curve_obj):
+    def handle_new_lap(self, lap_0=False):
         print("NEW LAP")
-        self.should_update = True
         
-        # 0) increment lap
-        self.lap += 1
+        curve_obj = bpy.data.objects["Spiral_Curve"]
+        
         bpy.context.scene.five_tp_props.current_lap_count += 1
         
-        selected_points = self.smooth_and_shrinkwrap_curve(curve_obj, bpy.data.objects["model"])
+        selected_points = self.smooth_and_shrinkwrap_curve(curve_obj, bpy.data.objects["model"], lap_0=lap_0)
         
         if selected_points:
             bpy.context.scene.five_tp_props.points.clear()
@@ -256,7 +184,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 point.x = p.co.x 
                 point.y = p.co.y
                 point.z = p.co.z
-                print(p.co.xyz)
             
             selected_coords = [(point.co.x, point.co.y, point.co.z) for point in selected_points]
             # 1/2) Add to global array and adjust Z-values
@@ -264,34 +191,83 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             last_points = [(point.co.xyz, point.co.y - last) for point in selected_points]
             self.all_points.append(last_points)
         
-        print(f"APPENDING LAST POINTS, ALLPOINTS LENGHT: {len(self.all_points)}")
-                
-        # 1) mean
-        if self.lap_points_mean == 0:
-            self.lap_points_mean = len(self.current_lap_points)
-        else:
-            #calulate the lap points mean
-            self.lap_points_mean = sum(len(row) for row in self.all_points) / len(self.all_points)
-            
-        #2) set bevel factor start
-        if len(self.current_lap_points) == 0:
-            factor = 1 
-        else:
-            factor = self.lap_points_mean / len(self.current_lap_points)
-        
-        factor_start = (1 - 1 / (self.lap + 1)) * factor
-        bpy.data.objects["Spiral_Curve"].data.bevel_factor_start = factor_start
-        bpy.props.overwrite_factor_start = factor_start
+        return selected_points
     
-    def find_point(self, current_point, current_direction, update_spiral = False):
+    def smooth_and_shrinkwrap_curve(self, curve_obj, target_obj, lap_0=False, smooth_iterations=10, shrinkwrap_offset=0.0):
+        """
+        Smooths the given curve object and then applies a shrinkwrap modifier to it using bpy.ops.
+        
+        Parameters:
+        - curve_obj: The Blender curve object to be smoothed and shrinkwrapped.
+        - target_obj: The target Blender object that the curve will be shrinkwrapped to (e.g., a mesh).
+        - smooth_iterations: The number of smoothing iterations to apply to the curve.
+        - shrinkwrap_offset: The offset distance for the shrinkwrap modifier.
+        
+        Returns:
+        - The curve object after smoothing and shrinkwrapping.
+        """
+        # Ensure the object is in Object mode
+        bpy.context.view_layer.objects.active = curve_obj
+
+        print(f"Smoothing curve with {smooth_iterations} iterations...")
+        
+        # Switch to Edit mode to smooth the curve
+        bpy.ops.object.mode_set(mode='EDIT')
+        
+        # Select the relevant points that you want to smooth
+        bpy.ops.curve.select_all(action='DESELECT')  # First deselect all
+        
+        if lap_0:
+            for point in curve_obj.data.splines[0].points:
+                point.select = True  # Select the points to smooth
+        else:
+            for point in curve_obj.data.splines[0].points[-len(self.current_lap_points):]:
+                point.select = True  # Select the points to smooth
+               
+        selected_points = [point for point in curve_obj.data.splines[0].points if point.select]
+        
+        for i in range(smooth_iterations):
+            bpy.ops.curve.smooth()  # Apply the smooth operation
+            print(f"Smoothed curve iteration {i + 1}")
+            
+            # Update and refresh after each smoothing step
+            bpy.context.view_layer.update()  # Ensure the view layer is updated
+            bpy.ops.wm.redraw_timer(type='DRAW', iterations=1)  # Force the viewport to refresh
+        
+        # Perform smoothing for the specified number of iterations
+        
+        # Switch back to Object mode after smoothing
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # Add Shrinkwrap modifier using bpy.ops
+        print("Adding Shrinkwrap modifier...")
+        bpy.ops.object.modifier_add(type='SHRINKWRAP')
+
+        # Get the Shrinkwrap modifier
+        shrinkwrap_modifier = curve_obj.modifiers[-1]
+        shrinkwrap_modifier.target = target_obj
+        shrinkwrap_modifier.offset = shrinkwrap_offset
+        shrinkwrap_modifier.wrap_method = 'NEAREST_SURFACEPOINT'  # Or use another method
+        print(f"Shrinkwrap modifier added: {shrinkwrap_modifier}")
+
+        # Apply the Shrinkwrap modifier
+        bpy.ops.object.modifier_apply(modifier=shrinkwrap_modifier.name)
+        print("Shrinkwrap modifier applied.")
+
+        # Final update and refresh to make sure everything is reflected
+        bpy.context.view_layer.update()  # Final view layer update
+        bpy.ops.wm.redraw_timer(type='DRAW', iterations=1)  # Final window redraw
+        
+        print(f"Returning {len(selected_points)} points")
+        return selected_points
+    
+    def find_point(self):
         global spiral_pcd
         global spiral_array
         global spiral_tree
         global big_pcd
         
         start_time = time.time()  # Start timer
-
-        print(f"find_point, update: {update_spiral}")
         
         """
         Finds the intersection point of three surfaces and ensures movement is in the correct direction.
@@ -308,7 +284,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         - mean_point: np.array, the new intersection point.
         - normal_at_point: np.array, the normal at the new point.
         """
-        sphere_center = current_point  # Replace with the desired center of the sphere
+        sphere_center = self.current_point  # Replace with the desired center of the sphere
         sphere_radius = 0.2  # Replace with the radius of the sphere
 
         # Create the sphere geometry
@@ -330,34 +306,32 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         execution_time = end_time - start_time  # Compute execution time
         print(f"Execution Time INITIAL: {execution_time:.6f} seconds")
         
-        
-        if update_spiral:
+        if self.should_update:
+            
+            self.should_update = False
+            
             print("#####UPDATE SPIRAL######")
             start_time = time.time()
             self.spiral_pcd = o3d.geometry.PointCloud()
             
             last_points = []
-            
-            print("Populating sipral_curve pcd")
-            if len(bpy.context.scene.five_tp_props.points) > 0:
-                print("using props.points")
-                for p in bpy.context.scene.five_tp_props.points:
-                    last_points.append([p.x, p.y, p.z]) 
+            if not self.past_first:
+                self.past_first = True
+                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)
             else:
-                print("using curve")
-                last_points = [p.co[:3] for p in bpy.data.objects["Spiral_Curve"].data.splines[0].points][:-3]
+                last_points = self.handle_new_lap(lap_0=bpy.context.scene.five_tp_props.current_lap_count)[:-4]
                 
-               
-            current_spiral_points_np = np.array(last_points)  # Ensure correct shape (N,3)
+            print(f"last points length: {len(last_points)}")
+            current_spiral_points_np = np.array([p.co.xyz for p in last_points])  # Ensure correct shape (N,3)
 
             # Convert to Open3D format
             self.spiral_pcd.points = o3d.utility.Vector3dVector(current_spiral_points_np)  # ✅ Correct assignment
     
-            self.spiral_array = np.asarray(last_points)
+            self.spiral_array = np.asarray(self.spiral_pcd.points)
             self.spiral_tree = cKDTree(self.spiral_array)
             
-            z_min = min(last_points, key=lambda p: p[2])[2] - 0.2
-            z_max = max(last_points, key=lambda p: p[2])[2] + 0.2
+            z_min = min(current_spiral_points_np, key=lambda p: p[2])[2] - 0.2
+            z_max = max(current_spiral_points_np, key=lambda p: p[2])[2] + 0.2
             
             points = np.asarray(self.big_pcd.points)
             self.relevant_big_pcd_points = points[(points[:, 2] >= z_min) & (points[:, 2] <= z_max)]
@@ -406,9 +380,11 @@ class FiveTP_OT_Execute(bpy.types.Operator):
 #            print(f"passed spiral intersection test, dist: {dist_from_polyline}")
             
             # If both matches are valid, store the triplet and calculate the total distance
-            direction_now = mathutils.Vector(self.big_array[big_idx]) - current_point
-            if direction_now.dot(current_direction) > 0:
-#                print(f"ADDING: current_direction: {current_direction}, dot {direction_now.dot(current_direction)}")
+            direction_vector = np.array(self.big_array[big_idx]) - np.array(self.current_point)
+            dir_now_norm = np.array(direction_vector) / np.linalg.norm(direction_vector)
+            dir_curr_norm = np.array(self.current_direction) / np.linalg.norm(self.current_direction)
+            
+            if dir_now_norm.dot(dir_curr_norm) > 0.6:
     
                 duet = (self.big_array[big_idx], ball_point)
 #                print(f"appending: {duet}")
@@ -440,8 +416,14 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             print(f"Multiple clusters found: {unique_labels}: ENTER WINDOW")
             # Trigger visualization for the user to pick a point
             return self.visualize_triplets(np.array(triplets), self.big_array, spiral_array2, ball_array)
-
+        
+        
         optimal_triplet_idx = np.argmin(triplet_distances)
+        direction_vector = mathutils.Vector(triplets[optimal_triplet_idx][0]) - self.current_point
+        dir_now_norm = np.array(direction_vector) / np.linalg.norm(direction_vector)
+        dir_curr_norm = np.array(self.current_direction) / np.linalg.norm(self.current_direction)
+        
+        print(f"ADDING: cur_dir: {dir_curr_norm}, now_dir: {dir_now_norm}, dot: {dir_now_norm.dot(dir_curr_norm)}")
         return triplets[optimal_triplet_idx][0]
          
     def create_curve_from_points(self, points, curve_name="GeneratedCurve"):
@@ -462,8 +444,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         bpy.context.collection.objects.link(curve_object)  # Add to the scene
         return curve_object
 
-    should_update = True
-    
     def modal(self, context, event):
            
         if event.type == 'TIMER':
@@ -477,15 +457,12 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 self.current_point = curve_obj.data.splines[0].points[-1].co.xyz
             
             if self.current_direction is None:
+                print("update current direction {self.current_direction}")
                 self.last_point = curve_obj.data.splines[0].points[-4].co.xyz
                 self.current_direction = self.current_point - self.last_point
             
-            if self.should_update:
-                new_point = self.find_point(self.current_point, self.current_direction, update_spiral=True)
-                self.should_update = False
-            else:
-                new_point = self.find_point(self.current_point, self.current_direction, update_spiral=False)
-
+            new_point = self.find_point()
+            
             if new_point is None:
                 self.has_new_point = False
             
@@ -495,16 +472,13 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 self.current_lap_num_points += 1
                 self.current_lap_points.append(new_point)
                 
-                print(new_point)
                 self.current_direction = mathutils.Vector(new_point) - self.current_point
-                
                     
                 #new lap!:
                 if self.current_point[1] > 0 and new_point[1] < 0:
-                    should_update = True
-                    self.handle_new_lap(curve_obj)
-                    return {'RUNNING_MODAL'}
-                    
+                    self.should_update = True
+                    self.past_first = False
+
                 self.current_point = mathutils.Vector(new_point)
 
                 # Add new point to the spiral curve
@@ -685,68 +659,6 @@ class ModelPrepForSlicing:
         
         return separated_bottom
     
-#    def initial_spiral(self, curve):
-#        obj = curve
-#        if obj.type != 'CURVE':
-#            raise ValueError("Selected object is not a curve.")
-
-#        # Ensure the object is in Object mode
-#        bpy.ops.object.mode_set(mode='OBJECT')
-
-#        # Access the curve's data
-#        curve = obj.data
-
-#        # Get the first and last spline (assuming a single spline)
-#        spline = curve.splines[0]  # Assume first spline is the one we're working with
-
-#        # Extract the points (control points) from the spline
-#        points = spline.points
-
-#        # Get the current Z-value of the first point (since all points lie on the same plane)
-#        start_z = points[0].co.z
-
-#        # If all Z values are the same, adjust them by the desired Z-difference (0.2)
-#        desired_z_diff = 0.2
-#        num_points = len(points)
-
-#        # Loop through the points and adjust their Z-values
-#        for i, point in enumerate(points):
-#            # Calculate the interpolation factor based on the index
-#            z_factor = i / (num_points - 1)  # Scale the Z-value linearly between 0 and 1
-#            point.co.z = start_z + desired_z_diff * z_factor
-
-#        # Ensure the object gets updated
-#        bpy.context.view_layer.objects.active = obj
-
-#        print("Curve Z-values adjusted.")
-#        obj.name = "Spiral_Curve"
-#        obj.location.z -= 0.2
-#        
-#        print(f"Opening curve: {obj.name}")
-
-#        # Ensure the object is active and in edit mode
-#        bpy.context.view_layer.objects.active = obj
-#        obj.select_set(True)
-#        bpy.ops.object.mode_set(mode='EDIT')
-
-#        # Set curve to 'Poly' mode to ensure direct manipulation
-#        bpy.ops.curve.spline_type_set(type='POLY')
-
-#        # Switch to object mode to directly modify data
-#        bpy.ops.object.mode_set(mode='OBJECT')
-
-#        # Access the curve data
-#        spline = obj.data.splines[0]  # Assuming single spline for simplicity
-
-#        if spline.use_cyclic_u:  # If curve is closed, open it
-#            spline.use_cyclic_u = False
-#            print("Curve is now open.")
-
-#        # Update the curve data
-#        bpy.context.view_layer.update()
-
-#        print("Curve opened successfully.")
-
     def initial_spiral(self, curve):
         obj = curve
         if obj.type != 'CURVE':
