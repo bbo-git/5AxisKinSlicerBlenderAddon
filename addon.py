@@ -33,13 +33,14 @@ class FiveTP_OT_Execute(bpy.types.Operator):
     current_direction = None
 
     lap = 0
+    last_lap_num_points = 750
     current_lap_num_points = 0
     current_lap_points = []
     lap_points_mean = 0
     all_points = []
     lap_points_mean = 0
     
-    spiral_pcd = None
+    spiral_pcd = o3d.geometry.PointCloud()
     spiral_array = None
 
     big_pcd = None
@@ -161,28 +162,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             return mean_r
         else:
             return 0
-    
-    # Function to filter points within bounding box using numpy
-    def filter_points_within_bbox_chunk(self, points_chunk, bbox_min, bbox_max):
-        mask = np.all(np.logical_and(points_chunk >= bbox_min, points_chunk <= bbox_max), axis=1)
-        return points_chunk[mask]
-
-    # Function to split point cloud into chunks
-    def chunk_points(self, points, chunk_size):
-        return [points[i:i + chunk_size] for i in range(0, len(points), chunk_size)]
-
-    # Efficient filtering with parallelism
-    def parallel_filter(self, points, bbox_min, bbox_max, chunk_size=10000):
-        # Split points into chunks
-        chunks = self.chunk_points(points, chunk_size)
-        
-        # Parallel processing with ThreadPoolExecutor
-        with ThreadPoolExecutor() as executor:
-            results = list(executor.map(lambda chunk: self.filter_points_within_bbox_chunk(chunk, bbox_min, bbox_max), chunks))
-        
-        # Combine results from all chunks
-        filtered_points = np.vstack(results)
-        return filtered_points
 
     
     def handle_new_lap(self):
@@ -220,7 +199,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 curve_obj.data.splines[0].points[i].select = True
         elif not self.lap_increase:
             print("no new lap, but updating: get points from props")
-            for i in range(total_points - len(bpy.context.scene.five_tp_props.points), total_points):
+            for i in range(total_points - len(bpy.context.scene.five_tp_props.points) - len(self.current_lap_points), total_points):
                 curve_obj.data.splines[0].points[i].select = True
         else:
             print("NEW LAP")
@@ -229,8 +208,15 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 curve_obj.data.splines[0].points[i].select = True
         
         selected_points = [point for point in curve_obj.data.splines[0].points if point.select]
+        
+        if not self.lap_increase and not bpy.context.scene.five_tp_props.current_lap_count == 0:
+            return selected_points
+        
         self.last_mean_z = self.get_last_mean_z([p.co.xyz for p in selected_points])
         self.last_mean_r = self.get_last_mean_r([p.co.xyz for p in selected_points])
+        
+        if not bpy.context.scene.five_tp_props.current_lap_count == 0:
+            self.last_lap_num_points = len(selected_points)
             
         if self.lap_increase:
 #            for i in range(8):
@@ -239,6 +225,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             self.gaussian_smooth_curve(curve_obj, selected_points)
             
             bpy.ops.curve.subdivide(number_cuts=3)
+            
+            selected_points = [point for point in curve_obj.data.splines[0].points if point.select]
                 
             # Switch back to Object mode after smoothing
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -271,6 +259,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             
         ######HANDLE STATE POINTS############
         
+        
         if self.lap_increase:  
             self.current_lap_points = []
             self.current_lap_num_points = 0 
@@ -288,7 +277,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         return selected_points
     
-    def gaussian_smooth_curve(self, curve_obj, points, sigma=1.50):
+    def gaussian_smooth_curve(self, curve_obj, points, sigma=1.0):
         if len(points) < 2:
             print("Not enough points selected for smoothing.")
             return
@@ -358,13 +347,17 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         ball_bbox = ball_pcd.get_axis_aligned_bounding_box()
 
         # Define the expansion factor
-        expansion_factor = 0.1  # Adjust as needed
+        expansion_factor = 0.2  # Adjust as needed
         
         end_time = time.time()  # End timer
         execution_time = end_time - start_time  # Compute execution time
         print(f"Execution Time INITIAL: {execution_time:.6f} seconds")
         
-        if self.should_update:
+        z_cropped_big_pcd = o3d.geometry.PointCloud()
+        
+        if self.should_update or int(self.last_lap_num_points / 2) == len(self.current_lap_points):
+            if self.last_lap_num_points / 2 == len(self.current_lap_points):
+                print("###BECAUSE HALF LAP####")
             
             print("#####UPDATE SPIRAL######")
             start_time = time.time()
@@ -374,23 +367,25 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             if self.should_update:
                 self.should_update = False
                 
-            print(f"last points length: {len(last_points)}")
+            print(f"got {len(last_points)} points ")
             
             self.spiral_aray = np.array([])
-            self.spiral_array = np.copy(np.array([p.co.xyz for p in last_points]))  # Ensure correct shape (N,3)
-
+            self.spiral_array = np.array([p.co.xyz for p in last_points])  # Ensure correct shape (N,3)
+            self.spiral_pcd.points = o3d.utility.Vector3dVector(self.spiral_array)
+            
             # Convert to Open3D format
             
             self.spiral_tree = cKDTree(self.spiral_array)
             
-            z_min = min(self.spiral_array, key=lambda p: p[2])[2] - 0.2
-            z_max = max(self.spiral_array, key=lambda p: p[2])[2] + 0.2
+            z_min = min(self.spiral_array, key=lambda p: p[2])[2] - 0.3
+            z_max = max(self.spiral_array, key=lambda p: p[2])[2] + 0.3
             
             print(f"z_min: {z_min}, z_max: {z_max}, curr_height: {self.current_point[2]}")
             
             points = np.asarray(self.big_pcd.points)
             self.relevant_big_pcd_points = points[(points[:, 2] >= z_min) & (points[:, 2] <= z_max)]
-
+            z_cropped_big_pcd.points = o3d.utility.Vector3dVector(self.relevant_big_pcd_points)
+            
             self.big_array = np.asarray(self.relevant_big_pcd_points)
             self.big_tree = cKDTree(self.big_array)
             
@@ -407,11 +402,9 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         new_min_bound = ball_bbox.min_bound - expansion_factor
         new_max_bound = ball_bbox.max_bound + expansion_factor   
         expanded_bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=new_min_bound, max_bound=new_max_bound)
-        bbox_min = expanded_bbox.min_bound
-        bbox_max = expanded_bbox.max_bound
-           
-        filtered_spiral_pcd_points = self.parallel_filter(self.spiral_array, bbox_min, bbox_max)
-        spiral_array2 = np.asarray(filtered_spiral_pcd_points)
+          
+        filtered_spiral_pcd_points = self.spiral_pcd.crop(expanded_bbox)
+        spiral_array2 = np.asarray(filtered_spiral_pcd_points.points)
 
         # Store triplets and their corresponding distances
         triplets = []
@@ -429,8 +422,13 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 continue
 #            print(f"passed big array test, distance: {big_dist}")
 
-            dist_from_polyline = self.point_to_polyline_distance(ball_point, spiral_array2)
-            if abs(dist_from_polyline - 0.2) > radius :
+#            dist_from_polyline = self.point_to_polyline_distance(ball_point, spiral_array2)
+#            if abs(dist_from_polyline - 0.2) > radius :
+#                continue
+#            
+            spiral_dist, spiral_idx = self.spiral_tree.query(ball_point, distance_upper_bound=0.22)
+#            print(f"spiral_query: {spiral_dist}")
+            if abs(spiral_dist - 0.2) > radius :
                 continue
             
 #            print(f"passed spiral intersection test, dist: {dist_from_polyline}")
@@ -440,14 +438,17 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             dir_now_norm = np.array(direction_vector) / np.linalg.norm(direction_vector)
             dir_curr_norm = np.array(self.current_direction) / np.linalg.norm(self.current_direction)
             
+#            print(f"candidate dot product: {dir_now_norm.dot(dir_curr_norm)}")
             if dir_now_norm.dot(dir_curr_norm) > 0.6:
     
-                duet = (self.big_array[big_idx], ball_point)
-#                print(f"appending: {duet}")
+                triplet = (self.big_array[big_idx], ball_point, self.spiral_array[spiral_idx])
+#                print(f"appending: {triplet}")
                 
-                triplets.append(duet)
+                triplets.append(triplet)
                 distance_sum = (
-                    euclidean(duet[0], duet[1])
+                    euclidean(triplet[0], triplet[1]) +
+                    euclidean(triplet[1], triplet[2]) +
+                    euclidean(triplet[0], triplet[2])
                 )
                 triplet_distances.append(distance_sum)
             
@@ -457,9 +458,12 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if len(triplets) == 0:
             print("NO CANDIDATES FOUND: ENTER WINDOW")
-            filtered_big_pcd_points = self.parallel_filter(self.big_array, bbox_min, bbox_max)
-            big_array2 = np.asarray(filtered_big_pcd_points)
-            return self.visualize_triplets(np.array([]), big_array2, spiral_array2, ball_array)  
+            filtered_big_pcd_points = z_cropped_big_pcd.crop(expanded_bbox)
+            big_array2 = np.asarray(filtered_big_pcd_points.points)
+            dummy = np.array([(0,0,0),(0,0,0)])
+            
+            print(dummy.shape, big_array2.shape, spiral_array2.shape, ball_array.shape)
+            return self.visualize_triplets(dummy, big_array2, spiral_array2, ball_array)  
         
         # Perform DBSCAN clustering
         clustering = DBSCAN(eps=0.1, min_samples=2).fit(triplet_array)
@@ -473,12 +477,12 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         if len(unique_labels) > 2:
             print(f"Multiple clusters found: {unique_labels}: ENTER WINDOW")
             # Trigger visualization for the user to pick a point
-            filtered_big_pcd_points = self.parallel_filter(self.big_array, bbox_min, bbox_max)
-            big_array2 = np.asarray(filtered_big_pcd_points)
+            filtered_big_pcd_points = z_cropped_big_pcd.crop(expanded_bbox)
+            big_array2 = np.asarray(filtered_big_pcd_points.points)
             return self.visualize_triplets(np.array(triplets), big_array2, spiral_array2, ball_array)
         
-        
         optimal_triplet_idx = np.argmin(triplet_distances)
+        print(f"number of triplets: {len(triplets)}, distances: {triplet_distances} optimal_idx: {optimal_triplet_idx}")
         direction_vector = mathutils.Vector(triplets[optimal_triplet_idx][0]) - self.current_point
         dir_now_norm = np.array(direction_vector) / np.linalg.norm(direction_vector)
         dir_curr_norm = np.array(self.current_direction) / np.linalg.norm(self.current_direction)
@@ -545,9 +549,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 # Add new point to the spiral curve
                 bpy.data.objects["Spiral_Curve"].data.splines[0].points.add(count=1)
                 bpy.data.objects["Spiral_Curve"].data.splines[0].points[-1].co = (new_point[0], new_point[1], new_point[2], 1.0)   
-                
-                bpy.context.view_layer.update()
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
                 
             else:
                 print("No new point found, breaking out of the loop.")
