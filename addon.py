@@ -295,6 +295,26 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             p.co.x = smoothed_x[i]
             p.co.y = smoothed_y[i]
             p.co.z = smoothed_z[i]
+            
+    def filter_points_within_bbox(self, points, bbox_min, bbox_max):
+        """
+        Filters points that lie within a bounding box.
+
+        Parameters:
+        - points: np.array of shape (N, 3), the point cloud.
+        - bbox_min: np.array of shape (3,), the minimum bounds of the bounding box.
+        - bbox_max: np.array of shape (3,), the maximum bounds of the bounding box.
+
+        Returns:
+        - filtered_points: np.array of shape (M, 3), the points within the bounding box.
+        """
+        # Create a mask for points within the bounding box
+        mask = np.all((points >= bbox_min) & (points <= bbox_max), axis=1)
+        
+        # Apply the mask to filter the points
+        filtered_points = points[mask]
+        
+        return filtered_points
     
     def find_point(self):
         global spiral_pcd
@@ -384,7 +404,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
             
             points = np.asarray(self.big_pcd.points)
             self.relevant_big_pcd_points = points[(points[:, 2] >= z_min) & (points[:, 2] <= z_max)]
-            z_cropped_big_pcd.points = o3d.utility.Vector3dVector(self.relevant_big_pcd_points)
+#            z_cropped_big_pcd.points = o3d.utility.Vector3dVector(self.relevant_big_pcd_points)
             
             self.big_array = np.asarray(self.relevant_big_pcd_points)
             self.big_tree = cKDTree(self.big_array)
@@ -403,8 +423,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         new_max_bound = ball_bbox.max_bound + expansion_factor   
         expanded_bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound=new_min_bound, max_bound=new_max_bound)
           
-        filtered_spiral_pcd_points = self.spiral_pcd.crop(expanded_bbox)
-        spiral_array2 = np.asarray(filtered_spiral_pcd_points.points)
+        filtered_spiral_points = self.filter_points_within_bbox(self.spiral_array, self.spiral_pcd.get_min_bound(),  self.spiral_pcd.get_max_bound())
+        spiral_array2 = np.asarray(filtered_spiral_points)
 
         # Store triplets and their corresponding distances
         triplets = []
@@ -458,8 +478,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if len(triplets) == 0:
             print("NO CANDIDATES FOUND: ENTER WINDOW")
-            filtered_big_pcd_points = z_cropped_big_pcd.crop(expanded_bbox)
-            big_array2 = np.asarray(filtered_big_pcd_points.points)
+            filtered_big_pcd_points = self.filter_points_within_bbox(self.relevant_big_pcd_points, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
+            big_array2 = np.asarray(filtered_big_pcd_points)
             dummy = np.array([(0,0,0),(0,0,0)])
             
             print(dummy.shape, big_array2.shape, spiral_array2.shape, ball_array.shape)
@@ -477,8 +497,8 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         if len(unique_labels) > 2:
             print(f"Multiple clusters found: {unique_labels}: ENTER WINDOW")
             # Trigger visualization for the user to pick a point
-            filtered_big_pcd_points = z_cropped_big_pcd.crop(expanded_bbox)
-            big_array2 = np.asarray(filtered_big_pcd_points.points)
+            filtered_big_pcd_points = self.filter_points_within_bbox(z_cropped_big_pcd, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
+            big_array2 = np.asarray(filtered_big_pcd_points)
             return self.visualize_triplets(np.array(triplets), big_array2, spiral_array2, ball_array)
         
         optimal_triplet_idx = np.argmin(triplet_distances)
@@ -951,6 +971,100 @@ class FiveTPProperties(bpy.types.PropertyGroup):
     points: bpy.props.CollectionProperty(type=FiveTPPoint)
     points_index: bpy.props.IntProperty() 
     stop_execution: bpy.props.BoolProperty(name="Stop Execution", default=False)
+    points_per_unit: bpy.props.FloatProperty(
+        name="Points per Unit",
+        description="Number of points to resample per unit length of the curve",
+        default=10.0,
+        min=1.0,
+        soft_max=100.0
+    )
+    
+class ResampleCurveOperator(bpy.types.Operator):
+    bl_idname = "curve.resample"
+    bl_label = "Resample Curve"
+    
+    def execute(self, context):
+        curve_obj = context.object
+        if curve_obj.type != 'CURVE':
+            self.report({'ERROR'}, "Selected object is not a curve")
+            return {'CANCELLED'}
+
+        spline = curve_obj.data.splines[0]
+        if spline.type != 'POLY':
+            self.report({'ERROR'}, "Only poly splines are supported")
+            return {'CANCELLED'}
+
+        # Gather existing points
+        points = np.array([p.co.to_tuple() for p in spline.points])
+        distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        total_length = np.sum(distances)
+        
+        # Define new number of points
+        num_points = int(total_length * bpy.context.scene.five_tp_props.points_per_unit)
+        new_points = np.linspace(0, total_length, num_points)
+
+        # Cumulative distances to match new points
+        
+        print(f"Total length: {total_length}")
+        print(f"Points per unit: {bpy.context.scene.five_tp_props.points_per_unit}")
+        print(f"Num points: {num_points}")
+        print(f"Distances: {distances}")
+        print(f"Resampling range: {len(new_points)}")
+        
+        cumulative_distances = np.concatenate(([0], np.cumsum(distances)))
+        new_points_positions = np.interp(new_points, cumulative_distances, np.arange(len(points)))
+        resampled_points = []
+        for pos in new_points_positions:
+            idx = int(np.floor(pos) - 1)
+            t = pos - idx
+            interpolated = (1 - t) * points[idx] + t * points[idx + 1]
+            resampled_points.append(interpolated)
+            
+        bpy.ops.object.mode_set(mode = 'EDIT')
+        # Clear existing points
+        for i in range(len(spline.points)):
+            curve_obj.data.splines[0].points[i].select = True
+            
+        print(f"resampled points: {len(resampled_points)}") 
+           
+        bpy.ops.curve.delete(type='VERT')
+        
+        spline = curve_obj.data.splines.new(type='POLY')
+
+        # Add new points
+        spline.points.add(len(resampled_points))
+        
+        print(f"number of poly spline points: {len(spline.points)}")  # Add all points at once
+
+        for i, p in enumerate(resampled_points):
+            spline.points[i].co = (p[0], p[1], p[2], 1)
+#            bpy.context.view_layer.update()
+            if i < 5:  # Print first 5 points for debugging
+                print(f"Point {i}: {p}")
+                
+        bpy.ops.object.mode_set(mode='OBJECT')
+            
+        # Add Shrinkwrap modifier using bpy.ops
+        bpy.ops.object.modifier_add(type='SHRINKWRAP')
+
+        # Get the Shrinkwrap modifier
+        shrinkwrap_modifier = curve_obj.modifiers[-1]
+        shrinkwrap_modifier.target = bpy.data.objects["model"]
+        shrinkwrap_modifier.offset = 0
+        shrinkwrap_modifier.wrap_method = 'NEAREST_SURFACEPOINT'  # Or use another method
+        print(f"Shrinkwrap modifier added: {shrinkwrap_modifier}")
+
+        # Apply the Shrinkwrap modifier
+        bpy.ops.object.modifier_apply(modifier=shrinkwrap_modifier.name)
+        print("Shrinkwrap modifier applied.")
+
+        # Final update and refresh to make sure everything is reflected
+        bpy.context.view_layer.update()  # Final view layer update
+        bpy.ops.wm.redraw_timer(type='DRAW', iterations=1)  # Final win
+            
+        bpy.context.view_layer.update()
+
+        return {'FINISHED'}
 
 class FIVE_TP_OT_ClearPoints(bpy.types.Operator):
     """Clear all stored points"""
@@ -1002,6 +1116,8 @@ class PT_FiveTP_PT_Panel(bpy.types.Panel):
         layout.label(text="Lap Management")
         layout.operator("object.trim_to_whole_lap")
 
+        layout.operator("curve.resample")
+        layout.prop(props, "points_per_unit")
 
         layout.separator()
         
@@ -1051,6 +1167,7 @@ def register():
     bpy.utils.register_class(FiveTPProperties)
     bpy.types.Scene.five_tp_props = bpy.props.PointerProperty(type=FiveTPProperties)
     bpy.utils.register_class(PT_FiveTP_PT_Panel)
+    bpy.utils.register_class(ResampleCurveOperator)
     bpy.utils.register_class(FiveTP_OT_Execute)
     bpy.utils.register_class(FIVE_TP_OT_StopExecution)
     bpy.utils.register_class(FIVE_TP_OT_ClearPoints)
@@ -1064,6 +1181,7 @@ def unregister():
     bpy.utils.unregister_class(FiveTPPoint)
     bpy.utils.unregister_class(FiveTP_OT_ResetLapCount)
     bpy.utils.unregister_class(FiveTP_OT_Execute)
+    bpy.utils.unregister_class(ResampleCurveOperator)
     bpy.utils.unregister_class(FIVE_TP_OT_StopExecution)
     bpy.utils.unregister_class(PT_FiveTP_PT_Panel)
     bpy.utils.unregister_class(FIVE_TP_OT_ClearPoints)
