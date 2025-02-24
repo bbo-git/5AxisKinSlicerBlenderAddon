@@ -20,6 +20,25 @@ import json
 import time
 import gc
     
+def gaussian_smooth_curve(curve_obj, points, sigma=1.0):
+    if len(points) < 2:
+        print("Not enough points selected for smoothing.")
+        return
+
+    # Convert Blender points to NumPy array
+    coords = np.array([(p.co.x, p.co.y, p.co.z) for p in points])
+    
+    # Apply Gaussian smoothing on each axis separately
+    smoothed_x = gaussian_filter1d(coords[:, 0], sigma=sigma)
+    smoothed_y = gaussian_filter1d(coords[:, 1], sigma=sigma)
+    smoothed_z = gaussian_filter1d(coords[:, 2], sigma=sigma)
+
+    # Update the selected curve points
+    for i, p in enumerate(points):
+        p.co.x = smoothed_x[i]
+        p.co.y = smoothed_y[i]
+        p.co.z = smoothed_z[i]
+
 class FiveTP_OT_Execute(bpy.types.Operator):
     bl_idname = "five_tp.execute"
     bl_label = "Execute 5TP Algorithm"
@@ -195,8 +214,32 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if bpy.context.scene.five_tp_props.current_lap_count == 0:
             print("lap 0: get all available points")
-            for i in range(total_points - 1):
-                curve_obj.data.splines[0].points[i].select = True
+            # Get points from the curve
+            points = curve_obj.data.splines[0].points
+
+            # Track lap points
+            lap_points = []
+            found_lap_start_i = 0
+
+            for i in range(len(points) - 1, 0, -1):
+                curr_y = points[i].co.y
+                prev_y = points[i - 1].co.y
+
+                # Add points until we detect a downward crossing of Y = 0 (start of the lap)
+                lap_points.append(points[i])
+
+                if curr_y <= 0 and prev_y > 0:  # Detect crossing Y = 0 from above to below
+                    found_lap_start_i += 1
+                    if found_lap_start_i == 4:
+                        break
+
+            # Select lap points in Blender
+            for p in lap_points:
+                p.select = True
+
+#            print(f"Number of points in the lap: {len(lap_points)}")
+#            for i in range(total_points - 1):
+#                curve_obj.data.splines[0].points[i].select = True
         elif not self.lap_increase:
             print("no new lap, but updating: get points from props")
             for i in range(total_points - len(bpy.context.scene.five_tp_props.points) - len(self.current_lap_points), total_points):
@@ -222,7 +265,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
 #            for i in range(8):
 #                bpy.ops.curve.smooth()  # Apply the smooth operation
 #                
-            self.gaussian_smooth_curve(curve_obj, selected_points)
+            gaussian_smooth_curve(curve_obj, selected_points)
             
             bpy.ops.curve.subdivide(number_cuts=3)
             
@@ -276,25 +319,6 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         ########################################## 
         
         return selected_points
-    
-    def gaussian_smooth_curve(self, curve_obj, points, sigma=1.0):
-        if len(points) < 2:
-            print("Not enough points selected for smoothing.")
-            return
-
-        # Convert Blender points to NumPy array
-        coords = np.array([(p.co.x, p.co.y, p.co.z) for p in points])
-        
-        # Apply Gaussian smoothing on each axis separately
-        smoothed_x = gaussian_filter1d(coords[:, 0], sigma=sigma)
-        smoothed_y = gaussian_filter1d(coords[:, 1], sigma=sigma)
-        smoothed_z = gaussian_filter1d(coords[:, 2], sigma=sigma)
-
-        # Update the selected curve points
-        for i, p in enumerate(points):
-            p.co.x = smoothed_x[i]
-            p.co.y = smoothed_y[i]
-            p.co.z = smoothed_z[i]
             
     def filter_points_within_bbox(self, points, bbox_min, bbox_max):
         """
@@ -478,12 +502,12 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         
         if len(triplets) == 0:
             print("NO CANDIDATES FOUND: ENTER WINDOW")
-            filtered_big_pcd_points = self.filter_points_within_bbox(self.relevant_big_pcd_points, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
-            big_array2 = np.asarray(filtered_big_pcd_points)
-            dummy = np.array([(0,0,0),(0,0,0)])
-            
-            print(dummy.shape, big_array2.shape, spiral_array2.shape, ball_array.shape)
-            return self.visualize_triplets(dummy, big_array2, spiral_array2, ball_array)  
+#            filtered_big_pcd_points = self.filter_points_within_bbox(self.relevant_big_pcd_points, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
+#            big_array2 = np.asarray(filtered_big_pcd_points)
+#            dummy = np.array([(0,0,0),(0,0,0)])
+#            
+#            print(dummy.shape, big_array2.shape, spiral_array2.shape, ball_array.shape)
+            return None
         
         # Perform DBSCAN clustering
         clustering = DBSCAN(eps=0.1, min_samples=2).fit(triplet_array)
@@ -497,7 +521,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
         if len(unique_labels) > 2:
             print(f"Multiple clusters found: {unique_labels}: ENTER WINDOW")
             # Trigger visualization for the user to pick a point
-            filtered_big_pcd_points = self.filter_points_within_bbox(z_cropped_big_pcd, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
+            filtered_big_pcd_points = self.filter_points_within_bbox(self.relevant_big_pcd_points, expanded_bbox.get_min_bound(), expanded_bbox.get_max_bound())
             big_array2 = np.asarray(filtered_big_pcd_points)
             return self.visualize_triplets(np.array(triplets), big_array2, spiral_array2, ball_array)
         
@@ -570,9 +594,7 @@ class FiveTP_OT_Execute(bpy.types.Operator):
                 bpy.data.objects["Spiral_Curve"].data.splines[0].points.add(count=1)
                 bpy.data.objects["Spiral_Curve"].data.splines[0].points[-1].co = (new_point[0], new_point[1], new_point[2], 1.0)   
                 
-            else:
-                print("No new point found, breaking out of the loop.")
-                has_new_point = False
+            
 
         return {'RUNNING_MODAL'}
     
@@ -988,7 +1010,9 @@ class ResampleCurveOperator(bpy.types.Operator):
         if curve_obj.type != 'CURVE':
             self.report({'ERROR'}, "Selected object is not a curve")
             return {'CANCELLED'}
-
+        
+        gaussian_smooth_curve(curve_obj, curve_obj.data.splines[0].points)
+        
         spline = curve_obj.data.splines[0]
         if spline.type != 'POLY':
             self.report({'ERROR'}, "Only poly splines are supported")
