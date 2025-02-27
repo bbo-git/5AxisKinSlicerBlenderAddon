@@ -11,11 +11,15 @@ import math
 
 def wrap_angle_360(angle):
     """Wrap the angle to be between 0 and 360 degrees."""
-    return angle % 360
+    return context.scene.clamp_a_value % 360
 
-def constrain_angle(angle, max_angle):
-    """Constrain the angle to not exceed the maximum angle."""
-    return max(-max_angle, min(max_angle, angle))
+def constrain_angle_tanh(angle, max_angle):
+    """Constrain the angle using a tanh function to asymptotically damp the value to max_angle and -max_angle."""
+    return max_angle * np.tanh(angle / max_angle)
+
+def gaussian_weight(distance, sigma=1.0):
+    """Calculate Gaussian weight based on distance."""
+    return np.exp(-0.5 * (distance / sigma) ** 2)
 
 class CurvePointData(bpy.types.PropertyGroup):
     a: FloatProperty(name="Phi", default=0.0)
@@ -23,6 +27,7 @@ class CurvePointData(bpy.types.PropertyGroup):
     x_proj: FloatProperty(name="X Projected", default=0.0)
     y_proj: FloatProperty(name="Y Projected", default=0.0)
     z_proj: FloatProperty(name="Z Projected", default=0.0)
+    e: FloatProperty(name="Extruder", default=0.0)
     
 # PropertyGroup to store the curve analysis data
 class CurveAnalysisData(bpy.types.PropertyGroup):
@@ -67,8 +72,6 @@ class AnalyzeCurveOperator(bpy.types.Operator):
 
         kd_tree = cKDTree(pcd_points)
         
-        
-
         # Clear any previous data in the collection before adding new ones
         curve_analysis_data.curve_points.clear()
 
@@ -77,37 +80,58 @@ class AnalyzeCurveOperator(bpy.types.Operator):
             p0 = points[i - 1]
             p1 = points[i]
             
-            _, nearest_idx = kd_tree.query(p1)
-            normal = pcd_normals[nearest_idx]
+            # Query multiple nearest neighbors within a radius of 1 mm
+            distances, indices = kd_tree.query(p1, k=10, distance_upper_bound=1.0)
+            valid_indices = indices[distances != np.inf]
+            valid_distances = distances[distances != np.inf]
+            
+            if len(valid_indices) == 0:
+                self.report({'ERROR'}, "No valid neighbors found within the specified radius")
+                return {'CANCELLED'}
+            
+            # Compute the mean normal vector with optional Gaussian weighting
+            normals = pcd_normals[valid_indices]
+            if len(valid_distances) > 1:
+                weights = gaussian_weight(valid_distances)
+                normal = np.average(normals, axis=0, weights=weights)
+            else:
+                normal = normals[0]
+            
+            normal /= np.linalg.norm(normal)  # Normalize the normal vector
             
             # Calculate the tangent vector
             tangent = p1 - p0
             tangent /= np.linalg.norm(tangent)
 
+            
             # Calculate the B-axis rotation angle
-            b_angle = math.degrees(math.atan2(tangent[1], tangent[0]))
+            b_angle = -90 - math.degrees(math.atan2(points[i][1], points[i][0]))
+            
+            bb_angle = math.degrees(math.atan2(tangent[1], tangent[0]))
 
             # Rotate the normal vector by the B-axis angle using 2D rotation formula
-            cos_b = math.cos(math.radians(b_angle))
-            sin_b = math.sin(math.radians(b_angle))
+            cos_b = math.cos(math.radians(bb_angle))
+            sin_b = math.sin(math.radians(bb_angle))
             rotated_normal_y = normal[1] * cos_b - normal[0] * sin_b
             rotated_normal_z = normal[2]
 
             # Calculate the A-axis tilt angle
             a_angle = math.degrees(math.atan2(rotated_normal_z, rotated_normal_y))
-            a_angle = constrain_angle(a_angle, 75)
+            a_angle = constrain_angle_tanh(a_angle, 60)
+
+            z_offset = context.scene.z_offset
 
             # Calculate the angle psi
             r = math.sqrt(p1[0]**2 + p1[1]**2)
             z_actual = p1[2]
-            psi = math.degrees(math.atan2(r, 38.8 + z_actual))
+            psi = math.degrees(math.atan2(r, z_offset + z_actual))
 
             # Calculate the new r_prime
-            r_prime = math.sqrt((z_actual + 38.8)**2 + r**2)
+            r_prime = math.sqrt((z_actual + z_offset)**2 + r**2)
 
             # Calculate the projected coordinates
             y_proj = r_prime * math.cos(math.radians(a_angle + psi + 90))
-            z_proj = r_prime * math.sin(math.radians(a_angle + psi + 90)) - 38.8
+            z_proj = r_prime * math.sin(math.radians(a_angle + psi + 90)) - z_offset
             x_proj = 0  # As per your requirement
 
             # Store the calculated data
@@ -117,6 +141,7 @@ class AnalyzeCurveOperator(bpy.types.Operator):
             new_point.z_proj = z_proj
             new_point.a = a_angle
             new_point.b = b_angle
+            new_point.e = math.sqrt((p1[0]- p0[0])**2 + (p1[1]- p0[1])**2 + (p1[2]- p0[2])**2)
         
         self.report({'INFO'}, "Curve analyzed: cylindrical coordinates and tilt angles stored")
         
@@ -164,6 +189,9 @@ class CreateGCodeOperator(bpy.types.Operator):
 
         total_rotation = 360.0
 
+        previous_b = None
+        previous_e = None
+
         for i in range(len(curve_analysis_data.curve_points)):
             point = curve_analysis_data.curve_points[i]
             x = point.x_proj
@@ -171,8 +199,60 @@ class CreateGCodeOperator(bpy.types.Operator):
             z = point.z_proj
             a = point.a
             b = point.b
+            e = point.e
+            
+            # Calculate volume of extruded filament
+            nozzle_diameter = 0.4
+            layer_height = 0.2
+            filament_diameter = context.scene.filament_diameter
+            filament_radius = filament_diameter / 2.0
+            volume = nozzle_diameter * layer_height * e
+            
+            if previous_e is not None:
+                filament_length = volume / (math.pi * (filament_radius ** 2)) + previous_e
+            else:
+                filament_length = volume / (math.pi * (filament_radius ** 2)) 
+                
+            extruder_axis = context.scene.extruder_axis
+            
+            if previous_b is not None:
+                if context.scene.is_clockwize and  previous_b > 0 and b < 0:
+                    gcode.append(f"G1 F400 X{x:.3f} Y{y:.3f} Z{z:.3f} A{a:.3f} B{(b + 360):.3f} {extruder_axis}{filament_length:.5f}")
+                    gcode.append(f"G92 B{b:.3f}")
+                    
+                elif not context.scene.is_clockwize and previous_b < 0 and b > 0:
+                    gcode.append(f"G1 F400 X{x:.3f} Y{y:.3f} Z{z:.3f} A{a:.3f} B{(b - 360):.3f} {extruder_axis}{filament_length:.5f}")
+                    gcode.append(f"G92 B{b:.3f}")
+            
+#            if previous_b is not None:
+#                if not context.scene.is_clockwize and  previous_b > 0 and b < 0:  # Crossing from +180 to -180
+#                    t = (180 - previous_b) / (b + 360 - previous_b)
+#                    
+#                    x_interp = previous_x + t * (x - previous_x)
+#                    y_interp = previous_y + t * (y - previous_y)
+#                    z_interp = previous_z + t * (z - previous_z)
+#                    a_interp = previous_a + t * (a - previous_a)
+#                    b_interp = 180.0
 
-            gcode.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} B{b:.3f} A{a:.3f} F1000")
+#                    gcode.append(f"G1 F400 X{x_interp:.3f} Y{y_interp:.3f} Z{z_interp:.3f} A{a_interp:.3f} B{b_interp:.3f} ")
+#                    gcode.append("G92 B180.000")
+
+#                elif context.scene.is_clockwize and previous_b < 0 and b > 0:  # Crossing from -180 to +180
+#                    t = (-180 - previous_b) / (b - previous_b - 360)
+#                    
+#                    x_interp = previous_x + t * (x - previous_x)
+#                    y_interp = previous_y + t * (y - previous_y)
+#                    z_interp = previous_z + t * (z - previous_z)
+#                    a_interp = previous_a + t * (a - previous_a)
+#                    b_interp = -180.0
+
+#                    gcode.append(f"G1 X{x_interp:.3f} F400 Y{y_interp:.3f} Z{z_interp:.3f} A{a_interp:.3f} B{b_interp:.3f}")
+#                    gcode.append("G92 B-180.000")
+               
+                gcode.append(f"G1 F400 X{x:.3f} Y{y:.3f} Z{z:.3f} A{a:.3f} B{b:.3f} {extruder_axis}{filament_length:.5f}")
+                
+            previous_b = b
+            previous_e = filament_length
 
         # Finalize the G-code
         gcode.append("M2 ; End of program")
@@ -203,11 +283,11 @@ def update_toolhead_position(self, context):
     for line in gcode_lines:
         if line.startswith("G1"):
             parts = line.split()
-            x = float(parts[1][1:])
-            y = float(parts[2][1:])
-            z = float(parts[3][1:])
-            b = float(parts[4][1:])
+            x = float(parts[2][1:])
+            y = float(parts[3][1:])
+            z = float(parts[4][1:])
             a = float(parts[5][1:])
+            b = float(parts[6][1:])
             positions.append((x, y, z, b, a))
 
     # Calculate the index based on the progress
@@ -222,7 +302,7 @@ def update_toolhead_position(self, context):
         print("moving toolhead")
         x = position[0]
         y = position[1]
-        z = position[2]
+        z = position[2] + context.scene.z_offset - 38.8
         b_theta = math.radians(position[3])
         a_theta = math.radians(position[4])
         toolhead.location = (x, y, z)
@@ -230,14 +310,26 @@ def update_toolhead_position(self, context):
         a_axis.rotation_euler = Euler((a_theta, 0, 0), 'XYZ')
 
 class CurveToolsPanel(bpy.types.Panel):
-    bl_label = "Curve Tools"
+    bl_label = "Generate G-Code"
     bl_idname = "OBJECT_PT_curve_tools"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'G-Code'
+    bl_category = '5TP G-Code'
 
     def draw(self, context):
         layout = self.layout
+        
+        layout.prop(context.scene, "z_offset", slider=True)
+        layout.prop(context.scene, "clamp_a_rotation", slider=True)
+        layout.prop(context.scene, "extruder_axis")
+        layout.prop(context.scene, "filament_diameter")
+        
+        layout.separator()
+        
+        layout.prop(context.scene, "is_clockwize")
+        
+        layout.separator()
+        
         layout.operator("object.analyze_curve")
         layout.operator("object.create_gcode")
         
@@ -262,6 +354,43 @@ def register():
         step=1,
         precision=3,
         update=update_toolhead_position  # Add the update callback
+    )
+    bpy.types.Scene.clamp_a_rotation = bpy.props.FloatProperty(
+        name="Clamp A Value",
+        description="",
+        default=75,
+        min=0.0,
+        max=90,
+        step=1,
+        precision=3
+    )
+    bpy.types.Scene.z_offset = bpy.props.FloatProperty(
+        name="Z Offset",
+        description="Distance from base to toolhead (in mm)",
+        default=38.8,
+        min=0.0,
+        max=100.0,
+        step=1,
+        precision=2
+    )
+    bpy.types.Scene.extruder_axis = bpy.props.StringProperty(
+        name="Extruder Axis",
+        description="Set the extruder axis letter (e.g., 'C' or 'E')",
+        default="C"
+    )
+    bpy.types.Scene.filament_diameter = bpy.props.FloatProperty(
+        name="Filament Diameter",
+        description="Diameter of the filament in mm",
+        default=1.75,
+        min=0.5,
+        max=3.0,
+        step=0.01,
+        precision=2
+    )
+    bpy.types.Scene.is_clockwize = bpy.props.BoolProperty(
+        name="Is Clockwize",
+        description="Does the spiral go clockwize?",
+        default=True
     )
 
 def unregister():
