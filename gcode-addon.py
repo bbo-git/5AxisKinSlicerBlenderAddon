@@ -107,12 +107,12 @@ class AnalyzeCurveOperator(bpy.types.Operator):
             # Calculate the B-axis rotation angle
             b_angle = -90 - math.degrees(math.atan2(points[i][1], points[i][0]))
             
-            bb_angle = math.degrees(math.atan2(tangent[1], tangent[0]))
+            tangent_angle = math.degrees(math.atan2(tangent[1], tangent[0]))
 
             # Rotate the normal vector by the B-axis angle using 2D rotation formula
-            cos_b = math.cos(math.radians(bb_angle))
-            sin_b = math.sin(math.radians(bb_angle))
-            rotated_normal_y = normal[1] * cos_b - normal[0] * sin_b
+            cos_tangent_angle = math.cos(math.radians(tangent_angle))
+            sin_tangent_angle = math.sin(math.radians(tangent_angle))
+            rotated_normal_y = normal[1] * cos_tangent_angle - normal[0] * sin_tangent_angle
             rotated_normal_z = normal[2]
 
             # Calculate the A-axis tilt angle
@@ -130,8 +130,8 @@ class AnalyzeCurveOperator(bpy.types.Operator):
             r_prime = math.sqrt((z_actual + z_offset)**2 + r**2)
 
             # Calculate the projected coordinates
-            y_proj = r_prime * math.cos(math.radians(a_angle + psi + 90))
-            z_proj = r_prime * math.sin(math.radians(a_angle + psi + 90)) - z_offset
+            y_proj = -r_prime * math.sin(math.radians(a_angle + psi))
+            z_proj = r_prime * math.cos(math.radians(a_angle + psi)) - z_offset
             x_proj = 0  # As per your requirement
 
             # Store the calculated data
@@ -146,6 +146,10 @@ class AnalyzeCurveOperator(bpy.types.Operator):
         self.report({'INFO'}, "Curve analyzed: cylindrical coordinates and tilt angles stored")
         
         return {'FINISHED'}
+    
+for i in range(10):
+    point = bpy.context.scene.curve_analysis_data.curve_points[i]
+    print(f"x:{point.b}")
     
 def draw_debug_line(start, end, color=(1, 0, 0)):
     bpy.ops.object.empty_add(location=start)
